@@ -73,11 +73,14 @@ class PythonPanelWindow(Gtk.ApplicationWindow):
         self.connect("delete-event", self._on_delete_event)
 
         # Open initial files, directories, or blank tab
+        self._initializing = True
         self._has_explicit_project = False
         dir_to_open = None
         files_to_open = []
         if initial_files:
             for item in initial_files:
+                if not item or not isinstance(item, str) or "\x00" in item:
+                    continue
                 abs_i = os.path.abspath(os.path.expanduser(item))
                 if os.path.isdir(abs_i):
                     dir_to_open = abs_i
@@ -93,19 +96,21 @@ class PythonPanelWindow(Gtk.ApplicationWindow):
                 parent_dir = os.path.dirname(f)
                 if os.path.isdir(parent_dir):
                     self.project_sidebar.set_project_root(parent_dir)
+                    self._has_explicit_project = True
 
-        # If no project specified from arguments, try restoring last project
+        # If no project specified from arguments, try restoring last project as soft default
         if not self.project_sidebar.get_project_root() and self._session_state.get("last_project"):
             last_p = self._session_state.get("last_project")
-            if os.path.isdir(last_p):
-                self._has_explicit_project = True
+            if isinstance(last_p, str) and os.path.isdir(last_p):
                 self.project_sidebar.set_project_root(last_p)
+                self._has_explicit_project = False
 
         # Fallback to current working directory if launched from a folder or repository
         if not self.project_sidebar.get_project_root():
             cwd = os.getcwd()
             if cwd and os.path.isdir(cwd) and cwd != os.path.expanduser("~") and cwd != "/":
                 self.project_sidebar.set_project_root(cwd)
+                self._has_explicit_project = False
             else:
                 self.project_sidebar.refresh()
 
@@ -115,9 +120,10 @@ class PythonPanelWindow(Gtk.ApplicationWindow):
         self.show_all()
         self.search_bar.set_reveal_child(False)
 
-        # Apply saved or requested sidebar visibility
-        initial_sidebar_vis = self._session_state.get("sidebar_visible", True)
+        # Apply saved or requested sidebar visibility (explicit folder open always shows sidebar)
+        initial_sidebar_vis = True if dir_to_open else self._session_state.get("sidebar_visible", True)
         self.toggle_project_sidebar(initial_sidebar_vis)
+        self._initializing = False
 
     def _get_config_dir(self) -> str:
         d = os.path.expanduser("~/.config/pythonpanel")
@@ -136,8 +142,16 @@ class PythonPanelWindow(Gtk.ApplicationWindow):
                 import json
                 with open(path, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                    if isinstance(data, dict):
-                        self._session_state.update(data)
+                if isinstance(data, dict):
+                    vis = data.get("sidebar_visible")
+                    if isinstance(vis, bool):
+                        self._session_state["sidebar_visible"] = vis
+                    pos = data.get("sidebar_position")
+                    if isinstance(pos, int) and not isinstance(pos, bool):
+                        self._session_state["sidebar_position"] = max(150, min(800, pos))
+                    last_p = data.get("last_project")
+                    if isinstance(last_p, str) and "\x00" not in last_p and os.path.isdir(last_p):
+                        self._session_state["last_project"] = os.path.abspath(last_p)
             except Exception:
                 pass
         self._saved_sidebar_pos = self._session_state.get("sidebar_position", 240)
@@ -1252,9 +1266,11 @@ class PythonPanelWindow(Gtk.ApplicationWindow):
             self._save_session_state()
 
     def _on_project_changed(self, root_path: str):
-        self._has_explicit_project = True
+        if not getattr(self, "_initializing", False):
+            self._has_explicit_project = True
         self.update_title()
-        self._save_session_state()
+        if not getattr(self, "_initializing", False):
+            self._save_session_state()
 
     def _get_current_file_path(self) -> Optional[str]:
         ed = self.get_current_editor()

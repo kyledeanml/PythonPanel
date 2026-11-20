@@ -6,6 +6,7 @@ native AST syntax verification, and Pylint diagnostics.
 """
 
 import os
+import re
 import sys
 import io
 import json
@@ -13,6 +14,7 @@ import code
 import codecs
 import signal
 import shutil
+import stat
 import builtins
 import tempfile
 import subprocess
@@ -21,18 +23,26 @@ import time
 import ast
 
 
+def _safe_positive_int(val, default=1) -> int:
+    try:
+        n = int(val)
+        return max(1, n)
+    except (ValueError, TypeError):
+        return default
+
+
 class Diagnostic:
     """Represents a single linter diagnostic (error, warning, convention, etc.)."""
 
     __slots__ = ("line", "column", "severity", "code", "message", "symbol")
 
     def __init__(self, line=1, column=1, severity="convention", code="", message="", symbol=""):
-        self.line = max(1, int(line) if isinstance(line, (int, str)) and str(line).isdigit() else 1)
-        self.column = max(1, int(column) if isinstance(column, (int, str)) and str(column).isdigit() else 1)
-        self.severity = (severity or "convention").lower()
-        self.code = code or ""
-        self.message = message or ""
-        self.symbol = symbol or ""
+        self.line = _safe_positive_int(line, 1)
+        self.column = _safe_positive_int(column, 1)
+        self.severity = str(severity or "convention").lower()
+        self.code = str(code or "")
+        self.message = str(message or "")
+        self.symbol = str(symbol or "")
 
     def __repr__(self):
         return f"<Diagnostic [{self.severity.upper()}] L{self.line}:C{self.column} {self.code}: {self.message}>"
@@ -44,20 +54,43 @@ class InterpreterManager:
     _active_interpreter = None
     _version_cache = {}
 
+    _VALID_INTERP_RE = re.compile(r"^(python|pypy)(\d+(\.\d+)*)?([a-z0-9._-]*)?$", re.IGNORECASE)
+
+    @classmethod
+    def _is_valid_python_binary(cls, real_path: str) -> bool:
+        """Verify target is a regular executable file and a genuine Python interpreter."""
+        if not real_path:
+            return False
+        try:
+            st = os.stat(real_path)
+            if not stat.S_ISREG(st.st_mode) or not os.access(real_path, os.X_OK):
+                return False
+        except OSError:
+            return False
+
+        base = os.path.basename(real_path)
+        if not cls._VALID_INTERP_RE.match(base):
+            return False
+        return True
+
     @classmethod
     def _resolve_binary(cls, path: str):
         """Resolve a path to an executable Python binary (handling directories gracefully)."""
-        if not path:
+        if not path or not isinstance(path, str) or "\x00" in path:
             return None
         expanded = os.path.abspath(os.path.expanduser(path))
         if os.path.isdir(expanded):
             for sub in ("python", "python3", os.path.join("bin", "python3"), os.path.join("bin", "python")):
                 cand = os.path.join(expanded, sub)
                 if os.path.isfile(cand) and os.access(cand, os.X_OK):
-                    return os.path.realpath(cand)
+                    real = os.path.realpath(cand)
+                    if cls._is_valid_python_binary(real):
+                        return real
             return None
         if os.path.isfile(expanded) and os.access(expanded, os.X_OK):
-            return os.path.realpath(expanded)
+            real = os.path.realpath(expanded)
+            if cls._is_valid_python_binary(real):
+                return real
         return None
 
     @classmethod
@@ -344,18 +377,26 @@ class PythonLinter:
         target_path = file_path
 
         if not target_path or not os.path.exists(target_path) or content is not None:
+            fd = None
             try:
                 fd, temp_file = tempfile.mkstemp(prefix="pythonpanel_lint_", suffix=".py")
                 with os.fdopen(fd, "w", encoding="utf-8", errors="replace") as f:
+                    fd = None
                     f.write(content if content else "")
                 target_path = temp_file
             except Exception as e:
+                if fd is not None:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
                 print(f"Error creating temp file for pylint: {e}")
                 return None
 
         pylint_bin = cls._find_pylint_executable() or "pylint"
         cmd = [
             pylint_bin,
+            "--rcfile=/dev/null",
             "--output-format=json",
             "--reports=n",
             "--score=n",
@@ -363,12 +404,18 @@ class PythonLinter:
             os.path.abspath(target_path)
         ]
 
+        safe_env = os.environ.copy()
+        safe_env["PYTHONNOUSERSITE"] = "1"
+        safe_env.pop("PYTHONPATH", None)
+
         try:
             proc = subprocess.run(
                 cmd,
                 capture_output=True,
                 text=True,
                 errors="replace",
+                cwd=tempfile.gettempdir(),
+                env=safe_env,
                 timeout=15,
                 check=False
             )
@@ -377,14 +424,20 @@ class PythonLinter:
                 return []
 
             raw_data = json.loads(stdout)
+            if not isinstance(raw_data, list):
+                return []
             results = []
             for item in raw_data:
-                raw_type = item.get("type", "convention").lower()
+                if not isinstance(item, dict):
+                    continue
+                raw_type = str(item.get("type") or "convention").lower()
                 severity = "error" if raw_type in ("error", "fatal") else raw_type
+                raw_col = item.get("column", 0)
+                col_num = _safe_positive_int(raw_col, 0) + 1 if raw_col is not None else 1
 
                 results.append(Diagnostic(
-                    line=item.get("line", 1),
-                    column=max(1, int(item.get("column", 0)) + 1),
+                    line=_safe_positive_int(item.get("line", 1), 1),
+                    column=max(1, col_num),
                     severity=severity,
                     code=item.get("message-id", ""),
                     message=item.get("message", ""),
@@ -449,12 +502,16 @@ class PythonRunner:
             self.is_running = True
 
         abs_file = os.path.abspath(file_path)
-        interpreter = custom_interpreter or InterpreterManager.get_active_interpreter()
-        args = list(script_args) if script_args else []
+        interpreter = (
+            InterpreterManager._resolve_binary(custom_interpreter)
+            if custom_interpreter
+            else None
+        ) or InterpreterManager.get_active_interpreter()
+        args = [str(a) for a in script_args] if script_args else []
 
         def _worker():
             work_dir = os.path.dirname(abs_file) or "."
-            cmd = [interpreter, "-u", abs_file] + args
+            cmd = [interpreter, "-u", "--", abs_file] + args
             rc = -1
 
             try:
@@ -542,9 +599,13 @@ class PythonRunner:
             return
 
         def _kill_tree(p):
+            self_pgid = os.getpgid(0)
             try:
                 pgid = os.getpgid(p.pid)
-                os.killpg(pgid, signal.SIGTERM)
+                if pgid > 1 and pgid != self_pgid:
+                    os.killpg(pgid, signal.SIGTERM)
+                else:
+                    p.terminate()
             except Exception:
                 try:
                     p.terminate()
@@ -558,7 +619,10 @@ class PythonRunner:
 
             try:
                 pgid = os.getpgid(p.pid)
-                os.killpg(pgid, signal.SIGKILL)
+                if pgid > 1 and pgid != self_pgid:
+                    os.killpg(pgid, signal.SIGKILL)
+                else:
+                    p.kill()
             except Exception:
                 try:
                     p.kill()

@@ -44,6 +44,7 @@ class PythonWorkspacePanel(Gtk.Box):
     COL_COL = 3
     COL_CODE = 4
     COL_MESSAGE = 5
+    MAX_CONSOLE_CHARS = 500_000
 
     def __init__(self, editor_getter):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=0)
@@ -507,9 +508,17 @@ class PythonWorkspacePanel(Gtk.Box):
             else:
                 buf.insert(end, text)
 
+        self._trim_buffer_if_needed(buf)
         buf.move_mark(self._console_end_mark, buf.get_end_iter())
         self.console_view.scroll_to_mark(self._console_end_mark, 0.05, False, 0.0, 0.0)
         return False
+
+    def _trim_buffer_if_needed(self, buf: Gtk.TextBuffer):
+        overflow = buf.get_char_count() - self.MAX_CONSOLE_CHARS
+        if overflow > 0:
+            start_it = buf.get_start_iter()
+            cut_it = buf.get_iter_at_offset(overflow)
+            buf.delete(start_it, cut_it)
 
     def _append_console(self, text, tag_name=None):
         buf = self.console_buffer
@@ -520,6 +529,7 @@ class PythonWorkspacePanel(Gtk.Box):
         else:
             buf.insert(end, text)
 
+        self._trim_buffer_if_needed(buf)
         buf.move_mark(self._console_end_mark, buf.get_end_iter())
         self.console_view.scroll_to_mark(self._console_end_mark, 0.05, False, 0.0, 0.0)
         return False

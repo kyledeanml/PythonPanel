@@ -413,5 +413,239 @@ class TestProjectSidebar(unittest.TestCase):
             win.destroy()
 
 
+class TestSecurityAndIntegrityHardening(unittest.TestCase):
+    """Penetration, attack-vector, and error-resilience tests for PythonPanel."""
+
+    def setUp(self):
+        self.tmp_dir = tempfile.mkdtemp(prefix="pythonpanel_sec_test_")
+
+    def tearDown(self):
+        if os.path.exists(self.tmp_dir):
+            import shutil
+            shutil.rmtree(self.tmp_dir, ignore_errors=True)
+
+    def test_path_traversal_and_overwrite_prevention_in_project_tree(self):
+        from gi.repository import Gdk
+        if Gdk.Display.get_default() is None:
+            self.skipTest("Requires active display")
+
+        from project_tree import ProjectSidebar
+
+        proj_dir = os.path.join(self.tmp_dir, "proj")
+        outside_dir = os.path.join(self.tmp_dir, "proj_outside")
+        os.makedirs(proj_dir, exist_ok=True)
+        os.makedirs(outside_dir, exist_ok=True)
+
+        sidebar = ProjectSidebar(proj_dir)
+
+        # 1. Path traversal payloads must be blocked
+        traversal_payloads = [
+            "../escaped.py",
+            "../../escaped.py",
+            "/tmp/evil_abs.py",
+            "subdir/nested.py",
+            "\\evil.py",
+            "..",
+            ".",
+            "   ",
+            "null\x00byte.py",
+        ]
+        for payload in traversal_payloads:
+            with self.subTest(payload=payload):
+                with self.assertRaises(ValueError):
+                    sidebar.create_file_in_dir(proj_dir, payload)
+                with self.assertRaises(ValueError):
+                    sidebar.create_folder_in_dir(proj_dir, payload)
+
+        # 2. Safe creation succeeds and stays inside proj_dir
+        f1 = sidebar.create_file_in_dir(proj_dir, "safe_a.py")
+        f2 = sidebar.create_file_in_dir(proj_dir, "safe_b.py")
+        with open(f2, "w", encoding="utf-8") as f:
+            f.write("ORIGINAL_B_CONTENT")
+
+        # 3. Rename cannot traverse outside or silently clobber an existing file
+        with self.assertRaises(ValueError):
+            sidebar.rename_item(f1, "../outside_rename.py")
+        with self.assertRaises(FileExistsError):
+            sidebar.rename_item(f1, "safe_b.py")
+        with open(f2, "r", encoding="utf-8") as f:
+            self.assertEqual(f.read(), "ORIGINAL_B_CONTENT")
+
+        # 4. Protected root & external paths cannot be deleted
+        outside_file = os.path.join(outside_dir, "keep_me.py")
+        with open(outside_file, "w", encoding="utf-8") as f:
+            f.write("DO_NOT_DELETE")
+
+        with self.assertRaises(PermissionError):
+            sidebar.delete_item(proj_dir, is_dir=True)
+        with self.assertRaises(PermissionError):
+            sidebar.delete_item("/", is_dir=True)
+        with self.assertRaises(PermissionError):
+            sidebar.delete_item(outside_file, is_dir=False)
+        self.assertTrue(os.path.exists(outside_file))
+
+        # 5. Deleting a symlinked directory must only unlink the symlink, never rmtree target
+        symlink_dir = os.path.join(proj_dir, "linked_outside")
+        os.symlink(outside_dir, symlink_dir)
+        sidebar.delete_item(symlink_dir, is_dir=True)
+        self.assertFalse(os.path.lexists(symlink_dir))
+        self.assertTrue(os.path.exists(outside_file))
+
+        # 6. Prefix-collision directory (/tmp/proj_outside vs /tmp/proj) must not match highlight_file
+        sidebar.highlight_file(outside_file)
+
+    def test_interpreter_binary_spoofing_and_null_byte_rejection(self):
+        from python_tools import InterpreterManager
+
+        prev = InterpreterManager.get_active_interpreter()
+        try:
+            for bogus in ("/bin/sh", "/usr/bin/env", "/bin/ls", "/dev/null", self.tmp_dir, "/usr/bin/python3\x00--evil"):
+                self.assertFalse(
+                    InterpreterManager.set_active_interpreter(bogus),
+                    f"InterpreterManager should reject non-Python target: {bogus}",
+                )
+        finally:
+            InterpreterManager.set_active_interpreter(prev)
+
+    def test_pylint_untrusted_cwd_and_malicious_json_resilience(self):
+        from unittest.mock import patch, MagicMock
+        from python_tools import PythonLinter, Diagnostic
+
+        # Diagnostic must handle malformed types without ValueError/TypeError
+        d = Diagnostic(line="not_a_num", column=None, severity=None, code=123, message=None)
+        self.assertEqual(d.line, 1)
+        self.assertEqual(d.column, 1)
+        self.assertEqual(d.severity, "convention")
+
+        hostile_json = '[{"type": "error", "line": -99, "column": "bad", "message-id": "E9999", "message": "bad"}, "not_a_dict"]'
+        mock_proc = MagicMock(returncode=2, stdout=hostile_json, stderr="")
+        with patch.object(PythonLinter, "_find_pylint_executable", return_value="/usr/bin/pylint"), patch(
+            "subprocess.run", return_value=mock_proc
+        ) as run_mock:
+            diags = PythonLinter._run_pylint(None, "x = 1\n")
+            self.assertEqual(len(diags), 1)
+            self.assertEqual(diags[0].line, 1)
+            self.assertEqual(diags[0].column, 1)
+
+            # Verify --rcfile=/dev/null and isolated cwd/env were enforced
+            called_cmd = run_mock.call_args[0][0]
+            called_kwargs = run_mock.call_args[1]
+            self.assertIn("--rcfile=/dev/null", called_cmd)
+            self.assertEqual(called_kwargs.get("cwd"), tempfile.gettempdir())
+            self.assertEqual(called_kwargs.get("env", {}).get("PYTHONNOUSERSITE"), "1")
+            self.assertNotIn("PYTHONPATH", called_kwargs.get("env", {}))
+
+    def test_runner_option_injection_and_self_pgid_kill_protection(self):
+        import time
+        from unittest.mock import patch, MagicMock
+        from python_tools import PythonRunner
+
+        # 1. Script whose filename begins with '-' must execute via '--' separator
+        dash_script = os.path.join(self.tmp_dir, "-c_flag_test.py")
+        with open(dash_script, "w", encoding="utf-8") as f:
+            f.write("import sys\nprint('ARGS_OK:' + ','.join(sys.argv[1:]))\n")
+
+        runner = PythonRunner()
+        outputs = []
+        done = threading.Event()
+        rc_holder = []
+
+        runner.run(
+            dash_script,
+            on_output=lambda txt, err: outputs.append(txt),
+            on_finished=lambda rc: (rc_holder.append(rc), done.set()),
+            script_args=["--help", "-v"],
+            custom_interpreter="/bin/sh",  # Spoofed interpreter must be rejected and fall back to valid Python
+        )
+        self.assertTrue(done.wait(timeout=5.0))
+        self.assertEqual(rc_holder[0], 0)
+        self.assertIn("ARGS_OK:--help,-v", "".join(outputs))
+
+        # 2. PythonRunner.stop() must NEVER call os.killpg on PythonPanel's own process group
+        fake_proc = MagicMock()
+        fake_proc.pid = os.getpid()
+        fake_proc.poll.side_effect = [None, 0]
+        runner.process = fake_proc
+        with patch("os.killpg") as killpg_mock:
+            runner.stop()
+            time.sleep(0.08)
+            killpg_mock.assert_not_called()
+            fake_proc.terminate.assert_called()
+
+    def test_editor_fifo_device_oom_and_css_injection_protection(self):
+        from gi.repository import Gdk
+        if Gdk.Display.get_default() is None:
+            self.skipTest("Requires active display")
+
+        ed = RetinaEditor()
+
+        # 1. Named pipe (FIFO) must be rejected immediately without blocking
+        fifo_path = os.path.join(self.tmp_dir, "trap.fifo")
+        os.mkfifo(fifo_path)
+        with self.assertRaises(ValueError):
+            ed.load_file(fifo_path)
+
+        # 2. Oversized file exceeding MAX_FILE_SIZE_BYTES must be rejected before reading into buffer
+        big_path = os.path.join(self.tmp_dir, "oversized.py")
+        with open(big_path, "wb") as f:
+            f.write(b"#" * 2048)
+
+        orig_limit = RetinaEditor.MAX_FILE_SIZE_BYTES
+        try:
+            RetinaEditor.MAX_FILE_SIZE_BYTES = 1024
+            with self.assertRaises(ValueError):
+                ed.load_file(big_path)
+        finally:
+            RetinaEditor.MAX_FILE_SIZE_BYTES = orig_limit
+
+        # 3. Saving onto a directory or path with null byte must raise cleanly
+        with self.assertRaises(IsADirectoryError):
+            ed.save_file(self.tmp_dir)
+        with self.assertRaises(ValueError):
+            ed.save_file(os.path.join(self.tmp_dir, "bad\x00.py"))
+
+        # 4. CSS injection payload in font family must be stripped
+        ed.set_font_family_and_size('Monospace"; } * { background-color: red; } /*', "bad_size")
+        self.assertNotIn('"', ed.base_font_family)
+        self.assertNotIn('{', ed.base_font_family)
+        self.assertNotIn(';', ed.base_font_family)
+        self.assertEqual(ed.base_font_size, 11)
+
+    def test_corrupted_session_json_and_console_flood_cap(self):
+        from gi.repository import Gdk
+        if Gdk.Display.get_default() is None:
+            self.skipTest("Requires active display")
+
+        from unittest.mock import patch
+        from pythonpanel import PythonPanelWindow
+        from pylint_panel import PythonWorkspacePanel
+
+        # 1. Hostile session.json types must not crash window creation
+        bad_cfg_dir = os.path.join(self.tmp_dir, "cfg")
+        os.makedirs(bad_cfg_dir, exist_ok=True)
+        with open(os.path.join(bad_cfg_dir, "session.json"), "w", encoding="utf-8") as f:
+            f.write('{"sidebar_visible": "not_a_bool", "sidebar_position": -999999, "last_project": [1, 2, 3]}')
+
+        with patch.object(PythonPanelWindow, "_get_config_dir", return_value=bad_cfg_dir):
+            win = PythonPanelWindow(app=None)
+            try:
+                self.assertIsInstance(win._session_state["sidebar_visible"], bool)
+                self.assertGreaterEqual(win._saved_sidebar_pos, 150)
+                self.assertIsNone(win._session_state["last_project"])
+            finally:
+                win.destroy()
+
+        # 2. Console buffer flood protection caps characters to MAX_CONSOLE_CHARS
+        panel = PythonWorkspacePanel(lambda: None)
+        orig_max = PythonWorkspacePanel.MAX_CONSOLE_CHARS
+        try:
+            PythonWorkspacePanel.MAX_CONSOLE_CHARS = 1000
+            panel._append_console("A" * 800)
+            panel._append_console("B" * 800)
+            self.assertLessEqual(panel.console_buffer.get_char_count(), 1000)
+        finally:
+            PythonWorkspacePanel.MAX_CONSOLE_CHARS = orig_max
+
+
 if __name__ == '__main__':
     unittest.main()

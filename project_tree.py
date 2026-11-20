@@ -451,8 +451,12 @@ class ProjectSidebar(Gtk.Box):
         """Expand parent directories and select the active file in the tree."""
         if not self.project_root or not file_path:
             return
+        abs_root = os.path.abspath(self.project_root)
         abs_target = os.path.abspath(file_path)
-        if not abs_target.startswith(self.project_root):
+        try:
+            if os.path.commonpath([abs_root, abs_target]) != abs_root or abs_target == abs_root:
+                return
+        except ValueError:
             return
 
         # Ensure parent directories up to root are loaded and expanded
@@ -570,7 +574,12 @@ class ProjectSidebar(Gtk.Box):
             clipboard.set_text(text, -1)
 
     def _reveal_in_file_manager(self, target_path: str):
-        folder = target_path if os.path.isdir(target_path) else os.path.dirname(target_path)
+        if not target_path or "\x00" in str(target_path):
+            return
+        abs_target = os.path.abspath(target_path)
+        folder = abs_target if os.path.isdir(abs_target) else os.path.dirname(abs_target)
+        if not folder or not os.path.isdir(folder):
+            return
         try:
             Gio.AppInfo.launch_default_for_uri(GLib.filename_to_uri(folder, None), None)
         except Exception:
@@ -578,6 +587,79 @@ class ProjectSidebar(Gtk.Box):
                 subprocess.Popen(["xdg-open", folder])
             except Exception:
                 pass
+
+    @staticmethod
+    def _validate_child_path(dest_dir: str, child_name: str) -> str:
+        """Validate a single-component filename inside dest_dir, blocking path traversal."""
+        if not dest_dir or not isinstance(dest_dir, str) or "\x00" in dest_dir:
+            raise ValueError("Invalid destination directory.")
+        if not child_name or not isinstance(child_name, str) or "\x00" in child_name:
+            raise ValueError("File or folder name cannot be empty.")
+        clean_name = child_name.strip()
+        if not clean_name or clean_name in (".", ".."):
+            raise ValueError(f"Invalid name: '{child_name}'")
+        if "/" in clean_name or "\\" in clean_name or os.sep in clean_name:
+            raise ValueError("Name cannot contain path separators ('/' or '\\').")
+
+        abs_dest = os.path.abspath(dest_dir)
+        candidate = os.path.abspath(os.path.join(abs_dest, clean_name))
+        if os.path.dirname(candidate) != abs_dest or candidate == abs_dest:
+            raise ValueError("Path traversal outside target directory is not permitted.")
+        return candidate
+
+    def create_file_in_dir(self, dest_dir: str, fname: str) -> str:
+        new_path = self._validate_child_path(dest_dir, fname)
+        if not os.path.lexists(new_path):
+            with open(new_path, "w", encoding="utf-8") as f:
+                if new_path.endswith(".py"):
+                    f.write("#!/usr/bin/env python3\n\"\"\"Module description.\"\"\"\n\n")
+                else:
+                    f.write("")
+        self.refresh()
+        self.highlight_file(new_path)
+        self.emit("file-activated", new_path)
+        return new_path
+
+    def create_folder_in_dir(self, dest_dir: str, dname: str) -> str:
+        new_dir = self._validate_child_path(dest_dir, dname)
+        os.makedirs(new_dir, exist_ok=True)
+        self.refresh()
+        self.highlight_file(new_dir)
+        return new_dir
+
+    def rename_item(self, target_path: str, new_name: str) -> str:
+        if not target_path or "\x00" in str(target_path):
+            raise ValueError("Invalid target path.")
+        abs_old = os.path.abspath(target_path)
+        parent_dir = os.path.dirname(abs_old)
+        new_path = self._validate_child_path(parent_dir, new_name)
+        if os.path.lexists(new_path):
+            raise FileExistsError(f"Destination already exists: {os.path.basename(new_path)}")
+        os.rename(abs_old, new_path)
+        self.refresh()
+        self.highlight_file(new_path)
+        self.emit("file-renamed", abs_old, new_path)
+        return new_path
+
+    def delete_item(self, target_path: str, is_dir: bool = False):
+        if not target_path or "\x00" in str(target_path):
+            raise ValueError("Invalid target path.")
+        abs_target = os.path.abspath(target_path)
+        protected = {"/", os.path.abspath(os.path.expanduser("~"))}
+        if self.project_root:
+            abs_root = os.path.abspath(self.project_root)
+            protected.add(abs_root)
+            if os.path.commonpath([abs_root, abs_target]) != abs_root:
+                raise PermissionError("Refusing to delete path outside project root.")
+        if abs_target in protected:
+            raise PermissionError(f"Refusing to delete protected root directory: {abs_target}")
+
+        if os.path.islink(abs_target) or not is_dir:
+            os.unlink(abs_target)
+        else:
+            shutil.rmtree(abs_target)
+        self.refresh()
+        self.emit("file-deleted", abs_target)
 
     # --------------------------------------------------------------------------
     # Interactive Actions: New File / Folder / Rename / Delete
@@ -617,17 +699,8 @@ class ProjectSidebar(Gtk.Box):
         dialog.destroy()
 
         if resp == Gtk.ResponseType.OK and fname:
-            new_path = os.path.join(dest_dir, fname)
             try:
-                if not os.path.exists(new_path):
-                    with open(new_path, "w", encoding="utf-8") as f:
-                        if new_path.endswith(".py"):
-                            f.write("#!/usr/bin/env python3\n\"\"\"Module description.\"\"\"\n\n")
-                        else:
-                            f.write("")
-                self.refresh()
-                self.highlight_file(new_path)
-                self.emit("file-activated", new_path)
+                self.create_file_in_dir(dest_dir, fname)
             except Exception as e:
                 self._show_error_dialog(f"Could not create file:\n{e}")
 
@@ -665,11 +738,8 @@ class ProjectSidebar(Gtk.Box):
         dialog.destroy()
 
         if resp == Gtk.ResponseType.OK and dname:
-            new_dir = os.path.join(dest_dir, dname)
             try:
-                os.makedirs(new_dir, exist_ok=True)
-                self.refresh()
-                self.highlight_file(new_dir)
+                self.create_folder_in_dir(dest_dir, dname)
             except Exception as e:
                 self._show_error_dialog(f"Could not create folder:\n{e}")
 
@@ -707,12 +777,8 @@ class ProjectSidebar(Gtk.Box):
         dialog.destroy()
 
         if resp == Gtk.ResponseType.OK and new_name and new_name != old_name:
-            new_path = os.path.join(parent_dir, new_name)
             try:
-                os.rename(target_path, new_path)
-                self.refresh()
-                self.highlight_file(new_path)
-                self.emit("file-renamed", target_path, new_path)
+                self.rename_item(target_path, new_name)
             except Exception as e:
                 self._show_error_dialog(f"Could not rename:\n{e}")
 
@@ -736,12 +802,7 @@ class ProjectSidebar(Gtk.Box):
 
         if resp == Gtk.ResponseType.OK:
             try:
-                if is_dir:
-                    shutil.rmtree(target_path)
-                else:
-                    os.unlink(target_path)
-                self.refresh()
-                self.emit("file-deleted", target_path)
+                self.delete_item(target_path, is_dir=is_dir)
             except Exception as e:
                 self._show_error_dialog(f"Could not delete:\n{e}")
 

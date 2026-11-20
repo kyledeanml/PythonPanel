@@ -6,6 +6,7 @@ Provides a high-DPI (Retina) optimized text view using GtkSourceView 4.
 
 import os
 import re
+import stat
 import tempfile
 import gi
 
@@ -44,6 +45,8 @@ class RetinaEditor(Gtk.ScrolledWindow):
         1.10, 1.25, 1.40, 1.55, 1.75, 2.00, 2.25, 2.50, 3.00
     ]
     DEFAULT_ZOOM_INDEX = 5  # 1.00 (100%)
+    MAX_FILE_SIZE_BYTES = 50 * 1024 * 1024  # 50 MB memory protection cap
+    _FONT_SANITIZE_RE = re.compile(r'[^A-Za-z0-9 _.,+-]')
     _shared_css_provider = None
     _watermark_pixbuf = None
     _watermark_loaded = False
@@ -291,13 +294,19 @@ class RetinaEditor(Gtk.ScrolledWindow):
             self.apply_retina_font()
             self.emit("zoom-changed", self.get_zoom_percent())
 
+    @classmethod
+    def _sanitize_font_family(cls, family: str) -> str:
+        cleaned = cls._FONT_SANITIZE_RE.sub("", str(family or "Monospace")).strip()
+        return cleaned or "Monospace"
+
     def apply_retina_font(self):
         """
         Calculates and applies the high-DPI font size with subpixel anti-aliasing
         to ensure sharp glyph rendering at any scale.
         """
+        self.base_font_family = self._sanitize_font_family(self.base_font_family)
         scale = self.ZOOM_STEPS[self.zoom_index]
-        scaled_size = max(6, int(round(self.base_font_size * scale)))
+        scaled_size = max(6, min(288, int(round(self.base_font_size * scale))))
 
         font_desc = Pango.FontDescription(f"{self.base_font_family} {scaled_size}")
         self.source_view.override_font(font_desc)
@@ -321,8 +330,12 @@ class RetinaEditor(Gtk.ScrolledWindow):
 
     def set_font_family_and_size(self, family, size):
         """Update base font family and size."""
-        self.base_font_family = family
-        self.base_font_size = max(6, int(size))
+        self.base_font_family = self._sanitize_font_family(family)
+        try:
+            parsed_size = int(size)
+        except (ValueError, TypeError):
+            parsed_size = 11
+        self.base_font_size = max(6, min(96, parsed_size))
         self.apply_retina_font()
 
     # --------------------------------------------------------------------------
@@ -710,8 +723,19 @@ class RetinaEditor(Gtk.ScrolledWindow):
     def load_file(self, path: str) -> bool:
         """Load text from file path with automatic encoding fallback and null-byte protection."""
         try:
+            if not path or not isinstance(path, str) or "\x00" in path:
+                raise ValueError("Invalid file path.")
+            st = os.stat(path)
+            if not stat.S_ISREG(st.st_mode):
+                raise ValueError(f"Refusing to open non-regular file: {path}")
+            if st.st_size > self.MAX_FILE_SIZE_BYTES:
+                raise ValueError(
+                    f"File size ({st.st_size} bytes) exceeds maximum editor limit ({self.MAX_FILE_SIZE_BYTES} bytes)."
+                )
             with open(path, 'rb') as f:
-                raw_bytes = f.read()
+                raw_bytes = f.read(self.MAX_FILE_SIZE_BYTES + 1)
+            if len(raw_bytes) > self.MAX_FILE_SIZE_BYTES:
+                raise ValueError("File exceeds maximum editor memory limit.")
 
             had_nulls = b'\x00' in raw_bytes
             if had_nulls:
@@ -748,10 +772,12 @@ class RetinaEditor(Gtk.ScrolledWindow):
     def save_file(self, path: str = None) -> bool:
         """Save buffer content to disk safely without risking zero-byte truncation on encoding error."""
         target_path = path or self.file_path
-        if not target_path:
-            raise ValueError("No file path specified to save.")
+        if not target_path or not isinstance(target_path, str) or "\x00" in target_path:
+            raise ValueError("No valid file path specified to save.")
 
         abs_target = os.path.abspath(target_path)
+        if os.path.isdir(abs_target):
+            raise IsADirectoryError(f"Cannot overwrite directory: {abs_target}")
         text = self.get_text()
         if self.line_ending == "CRLF":
             text_to_write = text.replace("\n", "\r\n")
@@ -775,14 +801,16 @@ class RetinaEditor(Gtk.ScrolledWindow):
         is_symlink = os.path.islink(abs_target)
         if os.path.exists(abs_target):
             try:
-                existing_mode = os.stat(abs_target).st_mode
+                existing_mode = stat.S_IMODE(os.stat(abs_target).st_mode) & 0o777
             except OSError:
                 pass
 
         if not is_symlink and os.access(target_dir, os.W_OK):
             fd, tmp_path = tempfile.mkstemp(prefix=".pythonpanel_save_", dir=target_dir)
+            fd_closed = False
             try:
                 with os.fdopen(fd, 'wb') as f:
+                    fd_closed = True
                     f.write(encoded_bytes)
                     f.flush()
                     os.fsync(f.fileno())
@@ -793,6 +821,11 @@ class RetinaEditor(Gtk.ScrolledWindow):
                         pass
                 os.replace(tmp_path, abs_target)
             except Exception:
+                if not fd_closed:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
                 if os.path.exists(tmp_path):
                     try:
                         os.remove(tmp_path)
